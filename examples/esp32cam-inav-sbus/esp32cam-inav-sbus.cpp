@@ -18,12 +18,20 @@ const char* ap_password = "password123";
 #define IBUS_TX_PIN 12
 #define IBUS_RX_PIN 13  // Unused but needed for Serial1.begin
 
+// INAV MSP serial bridge. GPIO 1/3 are the ESP32-CAM programming UART.
+#define MSP_BAUD_RATE 115200
+#define MSP_TCP_PORT 83
+#define MSP_TX_PIN 1
+#define MSP_RX_PIN 3
+
 // Onboard Flash LED
 #define FLASH_LED_PIN GPIO_NUM_4
 
 CamAIThinker Camera;
 WebServer server(80);
 WiFiServer streamServer(81);
+WiFiServer mspServer(MSP_TCP_PORT);
+WiFiClient mspClient;
 WebSocketsServer controlSocket(82);
 
 // Global channel array in RC microsecond values (1000 - 2000)
@@ -738,9 +746,36 @@ void streamServerTask(void *pvParameters) {
   }
 }
 
+void bridgeMspSerial() {
+  if (!mspClient || !mspClient.connected()) {
+    if (mspClient) mspClient.stop();
+    WiFiClient incoming = mspServer.available();
+    if (incoming) {
+      mspClient = incoming;
+      mspClient.setNoDelay(true);
+    }
+  }
+
+  if (!mspClient || !mspClient.connected()) return;
+
+  uint8_t buffer[256];
+  int available = mspClient.available();
+  if (available > 0) {
+    size_t count = mspClient.read(buffer, min(available, (int)sizeof(buffer)));
+    Serial.write(buffer, count);
+  }
+
+  available = Serial.available();
+  if (available > 0) {
+    size_t count = Serial.readBytes(buffer, min(available, (int)sizeof(buffer)));
+    mspClient.write(buffer, count);
+  }
+}
+
 void setup() {
-  Serial.begin(115200);
-  Serial.println("\n--- ESP32-CAM iNav iBUS Web Controller Starting ---");
+  // UART0 is reserved exclusively for transparent MSP traffic; do not log to it.
+  Serial.begin(MSP_BAUD_RATE, SERIAL_8N1, MSP_RX_PIN, MSP_TX_PIN, false);
+  Serial.setDebugOutput(false);
 
   // Onboard LED Setup
   pinMode(FLASH_LED_PIN, OUTPUT);
@@ -748,13 +783,9 @@ void setup() {
 
   // IBUS Hardware Serial setup (standard non-inverted 115200 8N1)
   Serial1.begin(115200, SERIAL_8N1, IBUS_RX_PIN, IBUS_TX_PIN, false);
-  Serial.printf("IBUS output initialized on GPIO %d (115200 baud, 8N1)\n", IBUS_TX_PIN);
 
   // Setup Wi-Fi AP Mode
   WiFi.softAP(ap_ssid, ap_password);
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
 
   // Initialize Camera for JPEG streaming
   Camera.config.pixel_format = PIXFORMAT_JPEG;
@@ -762,28 +793,23 @@ void setup() {
   Camera.config.jpeg_quality = 12;
   Camera.config.fb_count = 2;
 
-  if (!Camera.begin()) {
-    Serial.println("Camera driver initialization failed");
-  } else {
-    Serial.println("Camera driver successfully initialized");
-  }
+  Camera.begin();
 
   // Setup Web Server Handlers
   server.on("/", HTTP_GET, handleRoot);
   server.begin();
-  Serial.println("HTTP server started");
 
   controlSocket.begin();
   controlSocket.onEvent(handleControlSocket);
   controlSocket.enableHeartbeat(500, 1500, 2);
-  Serial.println("WebSocket controls started on port 82");
+
+  mspServer.begin();
 
   // Keep the long-lived MJPEG connection away from the control web server.
   streamServer.begin();
   xTaskCreatePinnedToCore(
     streamServerTask, "MJPEG_Stream", 4096, NULL, 1, &streamTaskHandle, 1
   );
-  Serial.println("MJPEG stream started on port 81");
 
   // Spawn low-jitter IBUS sender task on Core 0 (leaving Core 1 for WiFi/Webserver processing)
   xTaskCreatePinnedToCore(
@@ -795,7 +821,6 @@ void setup() {
     &ibusTaskHandle,
     0   // Core 0
   );
-  Serial.println("IBUS FreeRTOS Task spawned on Core 0");
 }
 
 void loop() {
@@ -806,5 +831,6 @@ void loop() {
   }
   server.handleClient();
   controlSocket.loop();
+  bridgeMspSerial();
   delay(1);
 }
