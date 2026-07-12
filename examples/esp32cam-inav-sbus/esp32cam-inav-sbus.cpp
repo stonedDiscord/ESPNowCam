@@ -1,5 +1,5 @@
 /**************************************************
- * ESP32-CAM iNav SBUS Web Controller & Streamer
+ * ESP32-CAM iNav iBUS Web Controller & Streamer
  * Authored for ESPNowCam project integration
  **************************************************/
 
@@ -13,9 +13,9 @@
 const char* ap_ssid = "ESP32-CAM-Drone";
 const char* ap_password = "password123";
 
-// SBUS configuration
-#define SBUS_TX_PIN 12
-#define SBUS_RX_PIN 13  // Unused but needed for Serial1.begin
+// iBUS configuration
+#define IBUS_TX_PIN 12
+#define IBUS_RX_PIN 13  // Unused but needed for Serial1.begin
 
 // Onboard Flash LED
 #define FLASH_LED_PIN GPIO_NUM_4
@@ -29,20 +29,26 @@ WiFiServer streamServer(81);
 // Aux 1 = Ch5, Aux 2 = Ch6, Aux 3 = Ch7, Aux 4 = Ch8
 volatile uint16_t rc_channels[8] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 1000};
 volatile unsigned long last_rx_time = 0;
+volatile uint16_t cached_rssi_channel = 1000;
+volatile int8_t cached_rssi_dbm = -100;
+portMUX_TYPE rcMux = portMUX_INITIALIZER_UNLOCKED;
 
 // FreeRTOS task handle for IBUS transmitter
 TaskHandle_t ibusTaskHandle = NULL;
 TaskHandle_t streamTaskHandle = NULL;
 
-uint16_t wifiRssiChannel() {
+void updateWifiRssi() {
+  static float filtered_rssi = -100.0f;
   wifi_sta_list_t stations;
   if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) {
-    return 1000;
+    filtered_rssi = -100.0f;
+  } else {
+    filtered_rssi += 0.2f * (stations.sta[0].rssi - filtered_rssi);
   }
 
-  // ESP32 reports AP-client RSSI in dBm. Map -100..-40 dBm to 1000..2000.
-  int32_t rssi = constrain(stations.sta[0].rssi, -100, -40);
-  return map(rssi, -100, -40, 1000, 2000);
+  int32_t rssi = constrain((int32_t)lroundf(filtered_rssi), -100, -40);
+  cached_rssi_dbm = rssi;
+  cached_rssi_channel = map(rssi, -100, -40, 1000, 2000);
 }
 
 // Function to build and send the IBUS packet (32 bytes)
@@ -51,27 +57,25 @@ void sendIbusFrame() {
   packet[0] = 0x20; // Length
   packet[1] = 0x40; // Command/Type (0x40 for channels)
 
-  bool failsafe = (millis() - last_rx_time > 1000) || (last_rx_time == 0);
-  
+  uint16_t channels[8];
+  unsigned long rx_time;
+  portENTER_CRITICAL(&rcMux);
+  memcpy(channels, (const void *)rc_channels, sizeof(channels));
+  rx_time = last_rx_time;
+  portEXIT_CRITICAL(&rcMux);
+  bool failsafe = (millis() - rx_time > 1000) || (rx_time == 0);
+
   uint16_t local_channels[14];
-  
-  // Safe copy and failsafe logic
-  for(int i = 0; i < 14; i++) {
+  for (int i = 0; i < 14; i++) {
     if (failsafe) {
-      if (i == 2) {
-        local_channels[i] = 1000; // Force throttle min on failsafe
-      } else if (i < 4) {
-        local_channels[i] = 1500; // Center pitch, roll, yaw
-      } else {
-        local_channels[i] = (i < 8) ? rc_channels[i] : 1000;
-      }
+      local_channels[i] = (i < 4 && i != 2) ? 1500 : 1000;
     } else {
-      local_channels[i] = (i < 8) ? rc_channels[i] : 1500;
+      local_channels[i] = (i < 8) ? channels[i] : 1500;
     }
   }
 
   // iBUS carries 14 channels; expose the controller Wi-Fi link on channel 14.
-  local_channels[13] = wifiRssiChannel();
+  local_channels[13] = cached_rssi_channel;
 
   // Pack 14 channels (2 bytes per channel, little-endian)
   for (int i = 0; i < 14; i++) {
@@ -160,6 +164,10 @@ const char* html_dashboard = R"rawhtml(
         .status-dot.active {
             background: #00ff66;
             box-shadow: 0 0 8px #00ff66;
+        }
+        .status-dot.warning {
+            background: #ffaa00;
+            box-shadow: 0 0 8px #ffaa00;
         }
         .main-container {
             display: flex;
@@ -390,6 +398,7 @@ const char* html_dashboard = R"rawhtml(
                 <span class="status-label">Stream:</span>
                 <span id="stream-dot" class="status-dot active"></span>
             </div>
+            <div class="status-item"><span id="link-info">SAFE</span></div>
         </div>
     </header>
 
@@ -406,7 +415,7 @@ const char* html_dashboard = R"rawhtml(
             <div class="switch-container">
                 <span class="switch-label">ARM (AUX1)</span>
                 <label class="switch">
-                    <input type="checkbox" id="aux1" onchange="sendControl()">
+                    <input type="checkbox" id="aux1" onchange="armChanged()">
                     <span class="slider"></span>
                 </label>
             </div>
@@ -439,6 +448,8 @@ const char* html_dashboard = R"rawhtml(
             <div>YAW: <span id="tele-yaw">1500</span></div>
             <div>PITCH: <span id="tele-pitch">1500</span></div>
             <div>ROLL: <span id="tele-roll">1500</span></div>
+            <div>RSSI: <span id="tele-rssi">--</span></div>
+            <div>RTT: <span id="tele-rtt">--</span>ms</div>
         </div>
 
         <!-- Right Joystick: Pitch (Y) and Roll (X) -->
@@ -573,57 +584,112 @@ const char* html_dashboard = R"rawhtml(
         }
 
         let lastSendTime = 0;
-        function sendControl() {
+        let requestPending = false;
+        let controlsEnabled = true;
+
+        function armChanged() {
+            if (document.getElementById('aux1').checked &&
+                !confirm('Arm the aircraft? Keep propellers clear.')) {
+                document.getElementById('aux1').checked = false;
+            }
+            sendControl(true);
+        }
+
+        function safeControls() {
+            controlsEnabled = false;
+            state.throttle = 1000;
+            state.roll = state.pitch = state.yaw = 1500;
+            document.getElementById('aux1').checked = false;
+            sendControl(true);
+        }
+
+        function sendControl(force = false) {
             state.aux1 = document.getElementById('aux1').checked ? 2000 : 1000;
             state.aux2 = document.getElementById('aux2').checked ? 2000 : 1000;
             state.led = document.getElementById('led').checked ? 1 : 0;
 
             const now = Date.now();
-            if (now - lastSendTime < 50) return; // Rate limit requests to 20Hz
+            if (!force && (now - lastSendTime < 50 || requestPending)) return;
             lastSendTime = now;
+            requestPending = true;
 
             const url = `/control?r=${state.roll}&p=${state.pitch}&t=${state.throttle}&y=${state.yaw}&a1=${state.aux1}&a2=${state.aux2}&led=${state.led}`;
+            const started = performance.now();
             fetch(url)
-                .then(res => {
+                .then(async res => {
                     if (res.ok) {
+                        const status = await res.json();
                         const linkDot = document.getElementById('link-dot');
                         linkDot.classList.add('active');
+                        document.getElementById('tele-rssi').innerText = `${status.rssi}dBm`;
+                        document.getElementById('tele-rtt').innerText = Math.round(performance.now() - started);
+                        document.getElementById('link-info').innerText = status.failsafe ? 'FAILSAFE' : 'LIVE';
                         clearTimeout(window.linkTimeout);
                         window.linkTimeout = setTimeout(() => {
                             linkDot.classList.remove('active');
+                            document.getElementById('link-info').innerText = 'LOST';
                         }, 500);
                     }
                 })
-                .catch(err => console.error("Control send error: ", err));
+                .catch(err => console.error("Control send error: ", err))
+                .finally(() => requestPending = false);
         }
 
         // Refresh unchanged channel values so the receiver failsafe only trips
         // when the browser or Wi-Fi link is actually lost.
         setInterval(sendControl, 250);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) safeControls();
+            else controlsEnabled = true;
+        });
+        window.addEventListener('pagehide', safeControls);
     </script>
 </body>
 </html>
 )rawhtml";
 
 void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   server.send(200, "text/html", html_dashboard);
 }
 
-void handleControl() {
-  if (server.hasArg("r")) rc_channels[0] = server.arg("r").toInt();
-  if (server.hasArg("p")) rc_channels[1] = server.arg("p").toInt();
-  if (server.hasArg("t")) rc_channels[2] = server.arg("t").toInt();
-  if (server.hasArg("y")) rc_channels[3] = server.arg("y").toInt();
-  if (server.hasArg("a1")) rc_channels[4] = server.arg("a1").toInt();
-  if (server.hasArg("a2")) rc_channels[5] = server.arg("a2").toInt();
-  
-  if (server.hasArg("led")) {
-    int led_val = server.arg("led").toInt();
-    digitalWrite(FLASH_LED_PIN, led_val ? HIGH : LOW);
+bool readChannel(const char *name, uint16_t &value) {
+  if (!server.hasArg(name)) return false;
+  String input = server.arg(name);
+  if (input.length() < 4 || input.length() > 4) return false;
+  for (size_t i = 0; i < input.length(); i++) {
+    if (!isDigit(input[i])) return false;
   }
-  
+  long parsed = input.toInt();
+  if (parsed < 1000 || parsed > 2000) return false;
+  value = parsed;
+  return true;
+}
+
+void handleControl() {
+  uint16_t incoming[6];
+  const char *names[] = {"r", "p", "t", "y", "a1", "a2"};
+  for (int i = 0; i < 6; i++) {
+    if (!readChannel(names[i], incoming[i])) {
+      server.send(400, "application/json", "{\"error\":\"invalid channels\"}");
+      return;
+    }
+  }
+  if (!server.hasArg("led") || (server.arg("led") != "0" && server.arg("led") != "1")) {
+    server.send(400, "application/json", "{\"error\":\"invalid LED\"}");
+    return;
+  }
+
+  portENTER_CRITICAL(&rcMux);
+  memcpy((void *)rc_channels, incoming, sizeof(incoming));
   last_rx_time = millis();
-  server.send(200, "text/plain", "OK");
+  portEXIT_CRITICAL(&rcMux);
+  digitalWrite(FLASH_LED_PIN, server.arg("led") == "1" ? HIGH : LOW);
+
+  char response[64];
+  snprintf(response, sizeof(response), "{\"rssi\":%d,\"failsafe\":false}", cached_rssi_dbm);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", response);
 }
 
 void streamServerTask(void *pvParameters) {
@@ -661,7 +727,8 @@ void streamServerTask(void *pvParameters) {
 
       Camera.free();
       if (written == 0) break;
-      vTaskDelay(pdMS_TO_TICKS(40));
+      unsigned long link_age = millis() - last_rx_time;
+      vTaskDelay(pdMS_TO_TICKS(link_age > 500 ? 100 : 40));
     }
     client.stop();
   }
@@ -669,15 +736,15 @@ void streamServerTask(void *pvParameters) {
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- ESP32-CAM iNav SBUS Web Controller Starting ---");
+  Serial.println("\n--- ESP32-CAM iNav iBUS Web Controller Starting ---");
 
   // Onboard LED Setup
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW);
 
   // IBUS Hardware Serial setup (standard non-inverted 115200 8N1)
-  Serial1.begin(115200, SERIAL_8N1, SBUS_RX_PIN, SBUS_TX_PIN, false);
-  Serial.printf("IBUS output initialized on GPIO %d (115200 baud, 8N1)\n", SBUS_TX_PIN);
+  Serial1.begin(115200, SERIAL_8N1, IBUS_RX_PIN, IBUS_TX_PIN, false);
+  Serial.printf("IBUS output initialized on GPIO %d (115200 baud, 8N1)\n", IBUS_TX_PIN);
 
   // Setup Wi-Fi AP Mode
   WiFi.softAP(ap_ssid, ap_password);
@@ -724,6 +791,11 @@ void setup() {
 }
 
 void loop() {
+  static unsigned long last_rssi_update = 0;
+  if (millis() - last_rssi_update >= 250) {
+    last_rssi_update = millis();
+    updateWifiRssi();
+  }
   server.handleClient();
   delay(1);
 }
