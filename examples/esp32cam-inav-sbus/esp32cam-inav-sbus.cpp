@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <esp_wifi.h>
 #include <drivers/CamAIThinker.h>
 
@@ -23,6 +24,7 @@ const char* ap_password = "password123";
 CamAIThinker Camera;
 WebServer server(80);
 WiFiServer streamServer(81);
+WebSocketsServer controlSocket(82);
 
 // Global channel array in RC microsecond values (1000 - 2000)
 // Mode 2: Roll = Ch1, Pitch = Ch2, Throttle = Ch3, Yaw = Ch4
@@ -31,6 +33,7 @@ volatile uint16_t rc_channels[8] = {1500, 1500, 1000, 1500, 1000, 1000, 1000, 10
 volatile unsigned long last_rx_time = 0;
 volatile uint16_t cached_rssi_channel = 1000;
 volatile int8_t cached_rssi_dbm = -100;
+volatile bool control_socket_connected = false;
 portMUX_TYPE rcMux = portMUX_INITIALIZER_UNLOCKED;
 
 // FreeRTOS task handle for IBUS transmitter
@@ -63,7 +66,7 @@ void sendIbusFrame() {
   memcpy(channels, (const void *)rc_channels, sizeof(channels));
   rx_time = last_rx_time;
   portEXIT_CRITICAL(&rcMux);
-  bool failsafe = (millis() - rx_time > 1000) || (rx_time == 0);
+  bool failsafe = !control_socket_connected || (millis() - rx_time > 1000) || (rx_time == 0);
 
   uint16_t local_channels[14];
   for (int i = 0; i < 14; i++) {
@@ -467,6 +470,8 @@ const char* html_dashboard = R"rawhtml(
         const rightJoy = document.getElementById('right-joystick');
         const rightKnob = document.getElementById('right-knob');
         document.getElementById('camera-stream').src = `http://${location.hostname}:81/stream`;
+        let controlSocket;
+        let reconnectTimer;
 
         const state = {
             roll: 1500,
@@ -584,8 +589,30 @@ const char* html_dashboard = R"rawhtml(
         }
 
         let lastSendTime = 0;
-        let requestPending = false;
         let controlsEnabled = true;
+
+        function connectControls() {
+            clearTimeout(reconnectTimer);
+            controlSocket = new WebSocket(`ws://${location.hostname}:82/`);
+            controlSocket.onopen = () => {
+                document.getElementById('link-info').innerText = 'SAFE';
+                sendControl(true);
+            };
+            controlSocket.onmessage = event => {
+                const status = JSON.parse(event.data);
+                const linkDot = document.getElementById('link-dot');
+                linkDot.classList.toggle('active', !status.failsafe);
+                document.getElementById('tele-rssi').innerText = `${status.rssi}dBm`;
+                document.getElementById('tele-rtt').innerText = Math.round(performance.now() - status.sent);
+                document.getElementById('link-info').innerText = status.failsafe ? 'FAILSAFE' : 'LIVE';
+            };
+            controlSocket.onclose = () => {
+                document.getElementById('link-dot').classList.remove('active');
+                document.getElementById('link-info').innerText = 'LOST';
+                reconnectTimer = setTimeout(connectControls, 500);
+            };
+            controlSocket.onerror = () => controlSocket.close();
+        }
 
         function armChanged() {
             if (document.getElementById('aux1').checked &&
@@ -609,30 +636,10 @@ const char* html_dashboard = R"rawhtml(
             state.led = document.getElementById('led').checked ? 1 : 0;
 
             const now = Date.now();
-            if (!force && (now - lastSendTime < 50 || requestPending)) return;
+            if (!force && now - lastSendTime < 50) return;
+            if (!controlSocket || controlSocket.readyState !== WebSocket.OPEN) return;
             lastSendTime = now;
-            requestPending = true;
-
-            const url = `/control?r=${state.roll}&p=${state.pitch}&t=${state.throttle}&y=${state.yaw}&a1=${state.aux1}&a2=${state.aux2}&led=${state.led}`;
-            const started = performance.now();
-            fetch(url)
-                .then(async res => {
-                    if (res.ok) {
-                        const status = await res.json();
-                        const linkDot = document.getElementById('link-dot');
-                        linkDot.classList.add('active');
-                        document.getElementById('tele-rssi').innerText = `${status.rssi}dBm`;
-                        document.getElementById('tele-rtt').innerText = Math.round(performance.now() - started);
-                        document.getElementById('link-info').innerText = status.failsafe ? 'FAILSAFE' : 'LIVE';
-                        clearTimeout(window.linkTimeout);
-                        window.linkTimeout = setTimeout(() => {
-                            linkDot.classList.remove('active');
-                            document.getElementById('link-info').innerText = 'LOST';
-                        }, 500);
-                    }
-                })
-                .catch(err => console.error("Control send error: ", err))
-                .finally(() => requestPending = false);
+            controlSocket.send(`${state.roll},${state.pitch},${state.throttle},${state.yaw},${state.aux1},${state.aux2},${state.led},${performance.now()}`);
         }
 
         // Refresh unchanged channel values so the receiver failsafe only trips
@@ -643,6 +650,7 @@ const char* html_dashboard = R"rawhtml(
             else controlsEnabled = true;
         });
         window.addEventListener('pagehide', safeControls);
+        connectControls();
     </script>
 </body>
 </html>
@@ -653,43 +661,39 @@ void handleRoot() {
   server.send(200, "text/html", html_dashboard);
 }
 
-bool readChannel(const char *name, uint16_t &value) {
-  if (!server.hasArg(name)) return false;
-  String input = server.arg(name);
-  if (input.length() < 4 || input.length() > 4) return false;
-  for (size_t i = 0; i < input.length(); i++) {
-    if (!isDigit(input[i])) return false;
-  }
-  long parsed = input.toInt();
-  if (parsed < 1000 || parsed > 2000) return false;
-  value = parsed;
-  return true;
-}
-
-void handleControl() {
-  uint16_t incoming[6];
-  const char *names[] = {"r", "p", "t", "y", "a1", "a2"};
-  for (int i = 0; i < 6; i++) {
-    if (!readChannel(names[i], incoming[i])) {
-      server.send(400, "application/json", "{\"error\":\"invalid channels\"}");
-      return;
-    }
-  }
-  if (!server.hasArg("led") || (server.arg("led") != "0" && server.arg("led") != "1")) {
-    server.send(400, "application/json", "{\"error\":\"invalid LED\"}");
+void handleControlSocket(uint8_t client, WStype_t type, uint8_t *payload, size_t length) {
+  if (type == WStype_DISCONNECTED) {
+    control_socket_connected = false;
     return;
+  }
+  if (type == WStype_CONNECTED) {
+    control_socket_connected = true;
+    return;
+  }
+  if (type != WStype_TEXT || length >= 128) return;
+
+  payload[length] = '\0';
+  uint16_t incoming[6];
+  int led;
+  float sent;
+  int fields = sscanf((char *)payload, "%hu,%hu,%hu,%hu,%hu,%hu,%d,%f",
+                      &incoming[0], &incoming[1], &incoming[2], &incoming[3],
+                      &incoming[4], &incoming[5], &led, &sent);
+  if (fields != 8 || led < 0 || led > 1) return;
+  for (uint16_t channel : incoming) {
+    if (channel < 1000 || channel > 2000) return;
   }
 
   portENTER_CRITICAL(&rcMux);
   memcpy((void *)rc_channels, incoming, sizeof(incoming));
   last_rx_time = millis();
   portEXIT_CRITICAL(&rcMux);
-  digitalWrite(FLASH_LED_PIN, server.arg("led") == "1" ? HIGH : LOW);
+  digitalWrite(FLASH_LED_PIN, led ? HIGH : LOW);
 
-  char response[64];
-  snprintf(response, sizeof(response), "{\"rssi\":%d,\"failsafe\":false}", cached_rssi_dbm);
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", response);
+  char response[96];
+  snprintf(response, sizeof(response),
+           "{\"rssi\":%d,\"failsafe\":false,\"sent\":%.1f}", cached_rssi_dbm, sent);
+  controlSocket.sendTXT(client, response);
 }
 
 void streamServerTask(void *pvParameters) {
@@ -766,9 +770,13 @@ void setup() {
 
   // Setup Web Server Handlers
   server.on("/", HTTP_GET, handleRoot);
-  server.on("/control", HTTP_GET, handleControl);
   server.begin();
   Serial.println("HTTP server started");
+
+  controlSocket.begin();
+  controlSocket.onEvent(handleControlSocket);
+  controlSocket.enableHeartbeat(500, 1500, 2);
+  Serial.println("WebSocket controls started on port 82");
 
   // Keep the long-lived MJPEG connection away from the control web server.
   streamServer.begin();
@@ -797,5 +805,6 @@ void loop() {
     updateWifiRssi();
   }
   server.handleClient();
+  controlSocket.loop();
   delay(1);
 }
