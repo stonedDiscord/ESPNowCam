@@ -41,15 +41,15 @@ TaskHandle_t ibusTaskHandle = NULL;
 TaskHandle_t streamTaskHandle = NULL;
 
 void updateWifiRssi() {
-  static float filtered_rssi = -100.0f;
   wifi_sta_list_t stations;
+  int32_t rssi = -100;
   if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) {
-    filtered_rssi = -100.0f;
-  } else {
-    filtered_rssi += 0.2f * (stations.sta[0].rssi - filtered_rssi);
+    cached_rssi_dbm = rssi;
+    cached_rssi_channel = 1000;
+    return;
   }
 
-  int32_t rssi = constrain((int32_t)lroundf(filtered_rssi), -100, -40);
+  rssi = constrain((int32_t)stations.sta[0].rssi, -100, -40);
   cached_rssi_dbm = rssi;
   cached_rssi_channel = map(rssi, -100, -40, 1000, 2000);
 }
