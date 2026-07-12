@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <esp_wifi.h>
 #include <drivers/CamAIThinker.h>
 
 // Wi-Fi Access Point Config
@@ -33,6 +34,17 @@ volatile unsigned long last_rx_time = 0;
 TaskHandle_t ibusTaskHandle = NULL;
 TaskHandle_t streamTaskHandle = NULL;
 
+uint16_t wifiRssiChannel() {
+  wifi_sta_list_t stations;
+  if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK || stations.num == 0) {
+    return 1000;
+  }
+
+  // ESP32 reports AP-client RSSI in dBm. Map -100..-40 dBm to 1000..2000.
+  int32_t rssi = constrain(stations.sta[0].rssi, -100, -40);
+  return map(rssi, -100, -40, 1000, 2000);
+}
+
 // Function to build and send the IBUS packet (32 bytes)
 void sendIbusFrame() {
   uint8_t packet[32];
@@ -57,6 +69,9 @@ void sendIbusFrame() {
       local_channels[i] = (i < 8) ? rc_channels[i] : 1500;
     }
   }
+
+  // iBUS carries 14 channels; expose the controller Wi-Fi link on channel 14.
+  local_channels[13] = wifiRssiChannel();
 
   // Pack 14 channels (2 bytes per channel, little-endian)
   for (int i = 0; i < 14; i++) {
